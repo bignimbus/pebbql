@@ -1,0 +1,14 @@
+# Pebble build output
+build/
+.lock-waf_*
+*.pbw
+
+# Python (tools/)
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Claude Code local state
+.agents/

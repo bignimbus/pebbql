@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "pebble-watchface": {
+      "source": "coredevices/pebble-watchface-agent-skill",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/pebble-watchface/SKILL.md",
+      "computedHash": "7480a27c07aa33eed5d7155a3a5007b7b71b3aea84f7e79614ab70b0f901e5dd"
+    }
+  }
+}
