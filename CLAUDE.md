@@ -2,8 +2,9 @@
 
 A Pebble watchface that uses the GraphQL hexagraph as the clock face. The
 hexagon's perimeter is the dial; hour and minute are angular wedges that sweep
-continuously around it, clipped to the hex's footprint and masked into the
-visible white "petal" regions by the logo's own inner-triangle cutouts.
+continuously around it, clipped to the shape's footprint (hex with vertex
+bumps) and masked into the visible white "petal" regions by the logo's own
+inner-triangle cutouts.
 
 ## Build & install
 
@@ -77,44 +78,68 @@ Past-screen corners avoid sin/cos rounding artifacts at exact vertex angles.
 ```
 1. fill bg
 2. PDC pass 1   — paint everything in logo color, draw the image
-                  (cutouts and vertex circles overdraw the outer hex
-                  with the same color → only the hex shape is visible)
-3. wedges       — hour, then minute on top; both bleed past the hex
-4. outside-hex  — paint bg over everything outside the hex shape,
-   mask           confining the wedges to the hex's footprint
-5. PDC pass 2   — outer hex set to GColorClear (no-op so the pass-1
-                  hex isn't repainted over the wedges); cutouts paint
+                  (cutouts overdraw the hex with the same color, no
+                  visible effect; vertex circles produce the bumps
+                  protruding past the hex edges)
+3. wedges       — hour, then minute on top; both flow over the hex
+                  and bumps and bleed past onto bg
+4. outside-     — paint bg over everything outside the (hex ∪ bumps)
+   shape mask     shape, confining the wedges to the visible footprint
+                  while preserving wedge color that flowed onto the
+                  bumps
+5. PDC pass 2   — outer hex set to GColorClear (so the pass-1 hex
+                  isn't repainted over the wedges); cutouts paint
                   bg (revealing the GraphQL pattern through the
-                  wedges); vertex circles paint logo OR wedge color
-                  depending on whether the wedge angularly covers
-                  that vertex (so vertex bumps participate in the
-                  sweep instead of stamping over it)
+                  wedges); vertex circles set to GColorClear so they
+                  don't repaint over the wedge color the mask just
+                  preserved on the bumps
 ```
+
+The vertex circles are intentionally inert in pass 2 — they get drawn
+once in pass 1 and the wedge color flows over them like over any other
+part of the hex. No per-vertex angular logic, no "popping" at threshold
+transitions.
 
 `gdraw_command_set_hidden(cmd, true)` is documented but appears to be a
 no-op for path commands in this SDK — `GColorClear` (alpha=0) is the
 reliable way to suppress a PDC command without removing it from the list.
 
-#### Outside-hex mask
+#### Outside-shape mask
 
-A single `gpath_draw_filled` polygon paints bg everywhere outside the hex.
-The polygon is a screen-sized rect (CW) with a hex-shaped hole (CCW),
-joined by a degenerate "tunnel" edge that traverses the same line in both
-directions and cancels under non-zero winding:
+A single `gpath_draw_filled` polygon paints bg everywhere outside the
+visible shape. The polygon is a screen-sized rect (CW) with a hex-plus-
+bumps-shaped hole (CCW), joined by a degenerate "tunnel" that traverses
+the same line in both directions and cancels under non-zero winding:
 
 ```
-[0..3]  screen rect corners, CW
-[4]     screen-rect start corner again (close outer)
-[5]     hex vertex 0  (tunnel target)
-[6..10] hex vertices 5,4,3,2,1  (CCW)
-[11]    hex vertex 0 again (close inner)
-        → implicit close from [11] back to [0] = tunnel out, same line
-          as [4]→[5], so the tunnel is invisible in the rasterized fill
+[0..3]   screen rect corners, CW
+[4]      screen-rect start corner again (close outer)
+[5..58]  inner hole: 6 vertices × 9 arc points each (CCW)
+         visited in reverse SVG order (V_0, V_5, V_4, V_3, V_2, V_1)
+[59]     first arc point again (close inner)
+         → implicit close from [59] back to [0] = tunnel out, same
+           line as [4]→[5], so the tunnel is invisible
 ```
 
-The hex vertices come from the PDC itself (see "PDC `cmd[0]` has 7 points,
-not 6" below) — no hand-derived geometry, so the mask follows whatever the
-SVG defines.
+The hole replaces each hex vertex with the outer 240° arc of that
+vertex's bump circle, approximated as `BUMP_ARC_SEGMENTS` (= 8) chord
+segments. Implicit straight lines between consecutive vertices' arcs
+form the hex edges with the bump radius cut off at each end.
+
+For each vertex `V_i`, the arc:
+- starts at `V_i + r·dir((i+2)·60°)` — intersection with edge V_i→V_{i+1}
+- ends at `V_i + r·dir((i+4)·60°)` — intersection with edge V_i→V_{i-1}
+- sweeps -240° through the outward direction (`i·60°`)
+
+The hex vertices come from PDC `cmd[0]` (see "PDC `cmd[0]` has 7
+points, not 6" below) and the bump radius from `cmd[5]`, so the mask
+follows whatever the SVG defines without hand-derived constants. The
+mask polygon is built once at `window_load` and reused every frame.
+
+The 8-segment chord approximation is inscribed in the bump circle, so
+the bump's effective outline becomes a slight 8-gon. Chord depth is
+~0.034·r (sub-pixel at the rendered radius); raise `BUMP_ARC_SEGMENTS`
+if visible faceting ever shows up.
 
 ## The PDC, and why this isn't simple
 
@@ -169,13 +194,15 @@ The recolor callbacks decide fill colors by command index. The layout is
 fixed by the order of elements in `hexagraph.normalized.svg`:
 
 ```
-[0]       outer hexagon            → logo color (pass 1) / GColorClear (pass 2)
-[1..4]    inner-triangle cutouts   → bg color
-[5..10]   vertex circles           → logo OR wedge color (pass 2, by angle)
+[0]       outer hexagon            → pass 1 logo / pass 2 GColorClear
+[1..4]    inner-triangle cutouts   → pass 1 logo / pass 2 bg
+[5..10]   vertex circles           → pass 1 logo / pass 2 GColorClear
 ```
 
-If you reorder the SVG, update `HEX_PDC_INNER_FIRST` / `HEX_PDC_INNER_LAST`
-and the vertex-circle index range in `recolor_pass2_cb`.
+The bump radius for the outside-shape mask is also read from `cmd[5]`
+(all 6 circles share the same radius post-`scale_cb`). If you reorder
+the SVG, update `HEX_PDC_INNER_FIRST` / `HEX_PDC_INNER_LAST` and the
+bump-radius read in `prv_window_load`.
 
 ### PDC `cmd[0]` has 7 points, not 6
 

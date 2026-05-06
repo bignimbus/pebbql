@@ -1,29 +1,25 @@
 #include <pebble.h>
+#include <math.h>
 
 // =====================================================================
 // Theme: tokens persisted to storage, resolved to GColor at draw time.
 // Storing tokens (not raw GColor bytes) lets each platform map a choice
-// like "rhodamine" to a sensible value — magenta on color displays,
-// white on monochrome, etc.
+// like "rhodamine" to a sensible fallback on monochrome displays.
+//
+// All four theme axes (bg, logo, hour, minute) draw from the same set
+// of four colors. The Clay config UI hides rhodamine and gray on B&W
+// platforms via per-option capabilities, so users can't pick them on
+// aplite/diorite — but if a saved persist value somehow contains one
+// (e.g., the user moved across watches), color_resolve falls back to
+// a contrasting shade rather than crashing.
 // =====================================================================
 
 typedef enum {
-  THEME_LOGO_WHITE     = 0,
-  THEME_LOGO_BLACK     = 1,
-  THEME_LOGO_RHODAMINE = 2,
-} ThemeLogo;
-
-typedef enum {
-  THEME_BG_DARK  = 0,
-  THEME_BG_LIGHT = 1,
-} ThemeBg;
-
-typedef enum {
-  THEME_NOTCH_RHODAMINE = 0,
-  THEME_NOTCH_CYAN      = 1,
-  THEME_NOTCH_WHITE     = 2,
-  THEME_NOTCH_BLACK     = 3,
-} ThemeNotch;
+  THEME_COLOR_RHODAMINE = 0,  // #e10098 on color, contrast on B&W
+  THEME_COLOR_WHITE     = 1,  // #ffffff
+  THEME_COLOR_BLACK     = 2,  // #000000
+  THEME_COLOR_GRAY      = 3,  // #aaaaaa on color, contrast on B&W
+} ThemeColor;
 
 typedef struct __attribute__((packed)) {
   uint8_t bg;
@@ -36,46 +32,46 @@ typedef struct __attribute__((packed)) {
 
 static Theme s_theme;
 
-static GColor color_bg(ThemeBg t) {
-  return (t == THEME_BG_LIGHT) ? GColorWhite : GColorBlack;
-}
-
-static GColor color_logo(ThemeLogo t, ThemeBg bg) {
+// Background resolves with no contrast logic — it IS the contrast
+// reference for everything else. On B&W, ambiguous colors fall back
+// to black so the watch still has a defined bg.
+static GColor color_bg(ThemeColor t) {
   switch (t) {
-    case THEME_LOGO_BLACK:     return GColorBlack;
-    case THEME_LOGO_RHODAMINE: return PBL_IF_COLOR_ELSE(
-        GColorFashionMagenta,
-        bg == THEME_BG_LIGHT ? GColorBlack : GColorWhite);
-    case THEME_LOGO_WHITE:
-    default:                   return GColorWhite;
+    case THEME_COLOR_BLACK:     return GColorBlack;
+    case THEME_COLOR_WHITE:     return GColorWhite;
+    case THEME_COLOR_RHODAMINE: return PBL_IF_COLOR_ELSE(GColorFashionMagenta, GColorBlack);
+    case THEME_COLOR_GRAY:      return PBL_IF_COLOR_ELSE(GColorLightGray,    GColorBlack);
+    default:                    return GColorBlack;
   }
 }
 
-static GColor color_notch(ThemeNotch t, ThemeBg bg) {
-  GColor contrast = (bg == THEME_BG_LIGHT) ? GColorBlack : GColorWhite;
+// Foreground colors (logo, hour, minute) resolve with respect to the
+// already-resolved bg, so rhodamine/gray on B&W collapse to whichever
+// of black/white contrasts with bg.
+static GColor color_themed(ThemeColor t, GColor bg) {
+  GColor contrast = gcolor_equal(bg, GColorWhite) ? GColorBlack : GColorWhite;
   switch (t) {
-    case THEME_NOTCH_BLACK:     return GColorBlack;
-    case THEME_NOTCH_WHITE:     return GColorWhite;
-    case THEME_NOTCH_CYAN:      return PBL_IF_COLOR_ELSE(GColorPictonBlue, contrast);
-    case THEME_NOTCH_RHODAMINE:
-    default:                    return PBL_IF_COLOR_ELSE(GColorFashionMagenta, contrast);
+    case THEME_COLOR_BLACK:     return GColorBlack;
+    case THEME_COLOR_WHITE:     return GColorWhite;
+    case THEME_COLOR_RHODAMINE: return PBL_IF_COLOR_ELSE(GColorFashionMagenta, contrast);
+    case THEME_COLOR_GRAY:      return PBL_IF_COLOR_ELSE(GColorLightGray,    contrast);
+    default:                    return contrast;
   }
 }
 
 static void theme_load(void) {
   s_theme = (Theme) {
-    .bg     = THEME_BG_DARK,
-    .logo   = THEME_LOGO_WHITE,
-    .hour   = THEME_NOTCH_RHODAMINE,
-    .minute = THEME_NOTCH_CYAN,
+    .bg     = THEME_COLOR_BLACK,
+    .logo   = THEME_COLOR_RHODAMINE,
+    .hour   = THEME_COLOR_WHITE,
+    .minute = THEME_COLOR_GRAY,
   };
   if (persist_exists(PERSIST_KEY_THEME)) {
     persist_read_data(PERSIST_KEY_THEME, &s_theme, sizeof(s_theme));
   }
 }
 
-// Hook for the eventual config-message handler — left wired up but unused.
-static void __attribute__((unused)) theme_save(void) {
+static void theme_save(void) {
   persist_write_data(PERSIST_KEY_THEME, &s_theme, sizeof(s_theme));
 }
 
@@ -86,6 +82,10 @@ static void __attribute__((unused)) theme_save(void) {
 static Window *s_window;
 static Layer  *s_face_layer;
 static GDrawCommandImage *s_hexagraph;
+
+#ifdef PBL_PLATFORM_EMERY
+static GBitmap *s_stencil;
+#endif
 
 // Logo geometry resolved at window_load. The PDC's source viewbox is
 // 100x100; we scale it once to fit the smallest screen dimension.
@@ -105,42 +105,55 @@ static GPoint s_logo_center;
 //
 // Render pipeline per frame:
 //   1. fill bg
-//   2. PDC pass 1 — outer hexagon only (others painted same color)
-//   3. wedges — drawn over the hex, also bleed past it onto bg
-//   4. outside-hex mask — polygon "screen rect with hexagonal hole"
-//      painted in bg, restoring bg outside the hex shape and confining
-//      the wedges to the hex's footprint
+//   2. PDC pass 1 — hex + bumps painted in logo color
+//   3. wedges — drawn over the shape, also bleed past it onto bg
+//   4. outside-(hex ∪ bumps) mask — polygon "screen rect with hex-plus-
+//      bumps hole" painted in bg, confining the wedges to the visible
+//      shape's footprint while preserving the wedge color that flowed
+//      over the bumps
 //   5. PDC pass 2 — inner-triangle cutouts paint bg over the wedge in
-//      cutout areas (revealing the GraphQL pattern), vertex circles
-//      paint logo or wedge color depending on whether the wedge
-//      angularly covers them
+//      cutout areas (revealing the GraphQL pattern); outer hex and
+//      vertex circles painted GColorClear so they don't repaint over
+//      the wedge color the mask just preserved
 //
-// The mask polygon's hex hole uses the actual outer-hexagon vertices
-// from PDC cmd[0], so the geometry follows the SVG/PDC source of truth
-// without hand-derived constants.
+// The mask hole uses outer-hexagon vertices from PDC cmd[0] and the
+// bump radius from cmd[5], so the geometry follows the SVG/PDC source
+// of truth without hand-derived constants. Bumps are approximated as
+// 8-chord polygons; sub-pixel error at the rendered radius.
 // =====================================================================
 
 // Wedge angular half-widths (degrees). Total wedge sweep = 2× this.
-//   Hour:  30° wedge. Sweep rate 30°/hour.
-//   Min:   10° wedge. Sweep rate 6°/min.
+//   Hour:  12° wedge. Sweep rate 30°/hour.
+//   Min:    6° wedge. Sweep rate 6°/min.
 #define HOUR_WEDGE_HALF_DEG   6
-#define MIN_WEDGE_HALF_DEG    3
+#define MIN_WEDGE_HALF_DEG    4
 
 static int     s_far_distance_px;       // wedge outer-corner distance, past screen
 static int32_t s_hour_half_width;       // Pebble angle units
 static int32_t s_min_half_width;
 static GPoint  s_hex_vertices[6];       // outer hexagon corners, screen coords
-static GRect   s_screen_bounds;         // for the outside-hex mask polygon
 
 #define LOGO_MARGIN          12
 
-// PDC command layout, fixed by tools/hexagraph.normalized.svg ordering:
-//   [0]      outer hexagon          → logo color
-//   [1..4]   inner-triangle cutouts → bg color  (creates the evenodd effect)
-//   [5..10]  vertex circles         → logo color
+// PDC command layout, fixed by tools/hexagraph.normalized.svg ordering.
+// Pass 1 paints all commands in logo color; pass 2 recolors selectively:
+//   [0]      outer hexagon          (pass 2: GColorClear)
+//   [1..4]   inner-triangle cutouts (pass 2: bg → creates the cutouts)
+//   [5..10]  vertex circles         (pass 2: GColorClear)
 #define HEX_PDC_INNER_FIRST   1
 #define HEX_PDC_INNER_LAST    4
-#define HEX_PDC_EXPECTED_LEN 11
+
+// Outside-(hex ∪ bumps) mask polygon, pre-built once at window_load.
+//   4   screen-rect corners (CW in screen coords)
+//   1   close screen rect
+//  48   inner-hole boundary: 6 vertices × 9 arc points each (CCW)
+//   1   close inner hole
+// = 54 points total
+#define BUMP_ARC_SEGMENTS    8
+#define BUMP_ARC_POINTS      (BUMP_ARC_SEGMENTS + 1)
+#define MASK_HOLE_POINTS     (6 * BUMP_ARC_POINTS)
+#define MASK_TOTAL_POINTS    (5 + MASK_HOLE_POINTS + 1)
+static GPoint s_outside_mask_points[MASK_TOTAL_POINTS];
 
 // PDC scaling: walk every command, scale points + circle radii by num/den.
 typedef struct { int32_t num; int32_t den; } ScaleCtx;
@@ -161,11 +174,11 @@ static bool scale_cb(GDrawCommand *cmd, uint32_t index, void *ctx) {
   return true;
 }
 
-// PDC pass 1: paint everything in the logo color so only the outer
-// hexagon shape appears (cutouts and vertex circles overdraw the same
-// color, no visible effect). Edge highlights drawn after this pass sit
-// on top of a clean filled hexagon, ready to be clipped by pass 2.
-// Also unhides any command that pass 2 may have hidden last frame.
+// PDC pass 1: paint everything in the logo color so the visible
+// shape — hex with vertex bumps — is laid down as a single solid
+// silhouette. Cutouts (inner triangles) overdraw the hex with the
+// same color, no visible effect. Wedges drawn after this pass flow
+// over the silhouette and pass 2 reveals the cutouts.
 typedef struct { GColor logo; } RecolorPass1Ctx;
 
 static bool recolor_pass1_cb(GDrawCommand *cmd, uint32_t index, void *ctx_) {
@@ -175,59 +188,21 @@ static bool recolor_pass1_cb(GDrawCommand *cmd, uint32_t index, void *ctx_) {
   return true;
 }
 
-// Returns true when angle `a` lies within `half_width` of `center`
-// (using the shortest signed difference, mod TRIG_MAX_ANGLE).
-static bool angle_within(int32_t a, int32_t center, int32_t half_width) {
-  int32_t d = a - center;
-  while (d < 0) d += TRIG_MAX_ANGLE;
-  while (d >= TRIG_MAX_ANGLE) d -= TRIG_MAX_ANGLE;
-  if (d > TRIG_MAX_ANGLE / 2) d = TRIG_MAX_ANGLE - d;
-  return d <= half_width;
-}
-
-// PDC pass 2: cutouts paint bg over the wedges drawn between passes
-// (clipping them to the visible white petal regions); vertex circles
-// paint hour/min color when their angle is inside the corresponding
-// wedge, else logo. The outer hexagon is hidden — pass 1 drew it.
-typedef struct {
-  GColor  logo;
-  GColor  bg;
-  int32_t hour_angle;
-  int32_t hour_half_width;
-  GColor  hour_color;
-  int32_t min_angle;
-  int32_t min_half_width;
-  GColor  min_color;
-} RecolorPass2Ctx;
+// PDC pass 2: cutouts paint bg over the wedges drawn between passes,
+// clipping them to the visible petals. Outer hex and vertex circles
+// are inert — pass 1 painted them in logo color, the wedges drew over
+// the parts in their angular range, and the outside-(hex ∪ bumps)
+// mask preserves the result. (gdraw_command_set_hidden appears to be
+// a no-op for these commands; GColorClear is the reliable suppressor.)
+typedef struct { GColor bg; } RecolorPass2Ctx;
 
 static bool recolor_pass2_cb(GDrawCommand *cmd, uint32_t index, void *ctx_) {
   RecolorPass2Ctx *ctx = ctx_;
-  // Make the outer hexagon transparent so it doesn't repaint over the
-  // wedges drawn after pass 1. (gdraw_command_set_hidden appears to be
-  // a no-op for path commands in this SDK; GColorClear is reliable.)
-  if (index == 0) {
-    gdraw_command_set_fill_color(cmd, GColorClear);
-    return true;
-  }
   if (index >= HEX_PDC_INNER_FIRST && index <= HEX_PDC_INNER_LAST) {
     gdraw_command_set_fill_color(cmd, ctx->bg);
     return true;
   }
-  // Vertex circles at indices 5..10. Min checked first so it wins when
-  // both wedges cover the same vertex (matching min-on-top layering).
-  if (index >= 5 && index <= 10) {
-    int v = (int)index - 5;
-    int32_t va = (int32_t)v * (TRIG_MAX_ANGLE / 6);
-    if (angle_within(va, ctx->min_angle, ctx->min_half_width)) {
-      gdraw_command_set_fill_color(cmd, ctx->min_color);
-      return true;
-    }
-    if (angle_within(va, ctx->hour_angle, ctx->hour_half_width)) {
-      gdraw_command_set_fill_color(cmd, ctx->hour_color);
-      return true;
-    }
-  }
-  gdraw_command_set_fill_color(cmd, ctx->logo);
+  gdraw_command_set_fill_color(cmd, GColorClear);
   return true;
 }
 
@@ -269,36 +244,15 @@ static void draw_wedge(GContext *ctx, int32_t center, int32_t half_width,
   }
 }
 
-// Paints `color` over everything outside the outer hexagon. Uses the
-// non-zero winding rule to fill the area between an outer screen-rect
-// (CW) and an inner hex hole (CCW). The two duplicate vertices form a
-// degenerate "tunnel" between the two loops that cancels itself out.
+// Paints `color` over everything outside the (hex ∪ bumps) shape.
+// Uses the non-zero winding rule to fill between an outer screen-rect
+// (CW) and an inner shape-shaped hole (CCW). Hole boundary is
+// pre-built in s_outside_mask_points at window_load.
 static void draw_outside_hex(GContext *ctx, GColor color) {
-  GPoint mask[12];
-  // Outer screen rectangle, CW from top-left.
-  mask[0] = (GPoint){ s_screen_bounds.origin.x,
-                      s_screen_bounds.origin.y };
-  mask[1] = (GPoint){ s_screen_bounds.origin.x + s_screen_bounds.size.w,
-                      s_screen_bounds.origin.y };
-  mask[2] = (GPoint){ s_screen_bounds.origin.x + s_screen_bounds.size.w,
-                      s_screen_bounds.origin.y + s_screen_bounds.size.h };
-  mask[3] = (GPoint){ s_screen_bounds.origin.x,
-                      s_screen_bounds.origin.y + s_screen_bounds.size.h };
-  mask[4] = mask[0];                  // close outer loop
-  // Inner hex hole — opposite winding to the outer, so the "between"
-  // area fills under the non-zero rule.
-  mask[5]  = s_hex_vertices[0];       // tunnel into the hole
-  mask[6]  = s_hex_vertices[5];
-  mask[7]  = s_hex_vertices[4];
-  mask[8]  = s_hex_vertices[3];
-  mask[9]  = s_hex_vertices[2];
-  mask[10] = s_hex_vertices[1];
-  mask[11] = s_hex_vertices[0];       // close inner loop; implicit
-                                      // close to mask[0] is the tunnel
-                                      // out — same line as mask[4]→[5],
-                                      // so they cancel.
-
-  GPathInfo info = { .num_points = 12, .points = mask };
+  GPathInfo info = {
+    .num_points = MASK_TOTAL_POINTS,
+    .points     = s_outside_mask_points,
+  };
   GPath *path = gpath_create(&info);
   if (path) {
     graphics_context_set_fill_color(ctx, color);
@@ -310,52 +264,85 @@ static void draw_outside_hex(GContext *ctx, GColor color) {
 static void face_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
-  GColor logo = color_logo(s_theme.logo, s_theme.bg);
-  GColor bg   = color_bg(s_theme.bg);
-
-  graphics_context_set_fill_color(ctx, bg);
-  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-
-  if (!s_hexagraph) return;
+  GColor bg         = color_bg(s_theme.bg);
+  GColor logo       = color_themed(s_theme.logo,   bg);
+  GColor hour_color = color_themed(s_theme.hour,   bg);
+  GColor min_color  = color_themed(s_theme.minute, bg);
 
   time_t now = time(NULL);
   struct tm *t = localtime(&now);
   int32_t ha = hour_angle_at(t->tm_hour % 12, t->tm_min);
   int32_t ma = minute_angle_at(t->tm_min);
 
-  GColor hour_color = color_notch(s_theme.hour,   s_theme.bg);
-  GColor min_color  = color_notch(s_theme.minute, s_theme.bg);
+#ifdef PBL_PLATFORM_EMERY
+  if (s_stencil) {
+    // Stencil POC pipeline:
+    //   1. fill logo color over the entire screen
+    //   2. wedges
+    //   3. stencil bitmap drawn on top — palette[1] = bg color, so the
+    //      negative-space pixels paint bg over wedge bleed and the cutout
+    //      regions, while petal pixels (palette[0] = transparent) leave
+    //      logo/wedge color showing through.
+    graphics_context_set_fill_color(ctx, logo);
+    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+    draw_wedge(ctx, ha, s_hour_half_width, hour_color);
+    draw_wedge(ctx, ma, s_min_half_width,  min_color);
+    GColor *palette = gbitmap_get_palette(s_stencil);
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "stencil fmt=%d palette=%p p[0]=0x%02x p[1]=0x%02x",
+            gbitmap_get_format(s_stencil), palette,
+            palette ? palette[0].argb : 0xff,
+            palette ? palette[1].argb : 0xff);
+    if (palette) {
+      // Find whichever palette index has alpha=0 (the petal regions);
+      // leave it transparent. Set the OTHER to bg for the negative
+      // space + cutouts. Avoids guessing which index Pebble's PBI
+      // converter assigned to which.
+      if (palette[0].a == 0) {
+        palette[1] = bg;
+      } else if (palette[1].a == 0) {
+        palette[0] = bg;
+      } else {
+        // Neither transparent — alpha got stripped during conversion.
+        // Fall through; will look wrong but log will reveal cause.
+        palette[1] = bg;
+      }
+    }
+    graphics_context_set_compositing_mode(ctx, GCompOpSet);
+    graphics_draw_bitmap_in_rect(ctx, s_stencil, bounds);
+    return;
+  }
+#endif
+
+  graphics_context_set_fill_color(ctx, bg);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  if (!s_hexagraph) return;
 
   GDrawCommandList *cmds = gdraw_command_image_get_command_list(s_hexagraph);
 
-  // Pass 1: outer hexagon only — cutouts and vertex circles painted in
-  // logo color, so they overdraw to no visible effect.
+  // Pass 1: paint the whole PDC in logo color. The cutouts overdraw
+  // the hex with the same color (no visible effect); the vertex
+  // circles produce the visible bumps protruding past the hex edges.
   RecolorPass1Ctx rc1 = { .logo = logo };
   gdraw_command_list_iterate(cmds, recolor_pass1_cb, &rc1);
   gdraw_command_image_draw(ctx, s_hexagraph, s_logo_origin);
 
-  // Hour wedge, then minute wedge on top. Both bleed past the hex
+  // Hour wedge, then minute wedge on top. Both bleed past the shape
   // onto the surrounding bg; the next step trims that bleed.
   draw_wedge(ctx, ha, s_hour_half_width, hour_color);
   draw_wedge(ctx, ma, s_min_half_width,  min_color);
 
-  // Mask: paint bg over everything outside the hex shape, confining
-  // the wedges to the hex's footprint.
+  // Mask: paint bg outside (hex ∪ bumps), confining the wedges to the
+  // shape's footprint while preserving wedge color that flowed onto
+  // the bumps.
   draw_outside_hex(ctx, bg);
 
-  // Pass 2: cutouts mask the wedges to the visible petals; vertex
-  // circles take the wedge color when the wedge angularly covers them
-  // so the bumps participate in the sweep.
-  RecolorPass2Ctx rc2 = {
-    .logo            = logo,
-    .bg              = bg,
-    .hour_angle      = ha,
-    .hour_half_width = s_hour_half_width,
-    .hour_color      = hour_color,
-    .min_angle       = ma,
-    .min_half_width  = s_min_half_width,
-    .min_color       = min_color,
-  };
+  // Pass 2: cutouts paint bg, masking the wedges to the visible petals.
+  // Outer hex and vertex circles are GColorClear — pass 1 painted them
+  // and the mask preserved them along with whatever wedge color flowed
+  // over the bumps; repainting now would obliterate that.
+  RecolorPass2Ctx rc2 = { .bg = bg };
   gdraw_command_list_iterate(cmds, recolor_pass2_cb, &rc2);
   gdraw_command_image_draw(ctx, s_hexagraph, s_logo_origin);
 }
@@ -367,6 +354,10 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 static void prv_window_load(Window *window) {
   Layer *root = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(root);
+
+#ifdef PBL_PLATFORM_EMERY
+  s_stencil = gbitmap_create_with_resource(RESOURCE_ID_STENCIL);
+#endif
 
   s_hexagraph = gdraw_command_image_create_with_resource(RESOURCE_ID_HEXAGRAPH_PDC);
   if (s_hexagraph) {
@@ -397,17 +388,22 @@ static void prv_window_load(Window *window) {
     s_min_half_width  =
         ((int32_t)MIN_WEDGE_HALF_DEG  * TRIG_MAX_ANGLE) / 360;
 
-    // Read the actual outer-hexagon corners from PDC cmd[0] (the path
-    // is in PDC-local coords post-scale_cb; offset by s_logo_origin to
-    // get screen coords). This is the source of truth for the hex
-    // shape — the mask polygon below uses it to confine wedges to the
-    // hex footprint without hand-derived geometry.
+    // Read the visible shape's geometry from the PDC: outer-hexagon
+    // corners from cmd[0], bump centers from cmd[5..10] (one circle
+    // per hex vertex), bump radius from cmd[5] (all six share it
+    // post-scale_cb). The mask traces around these without any
+    // hand-derived constants.
     //
     // svg2pdc stores 7 points for the hex path: index 0 is the SVG
     // Move's start (a duplicate of vertex 0), indices 1..6 are the
     // six hex corners. So we skip index 0.
-    GDrawCommand *cmd0 = gdraw_command_list_get_command(
-        gdraw_command_image_get_command_list(s_hexagraph), 0);
+    //
+    // The bump circles are NOT centered on the hex vertices — they're
+    // inset inward along the V_i—O bisector by ~2.4 viewbox units in
+    // the GraphQL hexagraph. That's why we have to read both.
+    GDrawCommandList *cmd_list =
+        gdraw_command_image_get_command_list(s_hexagraph);
+    GDrawCommand *cmd0 = gdraw_command_list_get_command(cmd_list, 0);
     for (int i = 0; i < 6; i++) {
       GPoint p = gdraw_command_get_point(cmd0, i + 1);
       s_hex_vertices[i] = (GPoint){
@@ -415,7 +411,89 @@ static void prv_window_load(Window *window) {
         .y = (int16_t)(p.y + s_logo_origin.y),
       };
     }
-    s_screen_bounds = bounds;
+    GPoint bump_centers[6];
+    for (int i = 0; i < 6; i++) {
+      GDrawCommand *bump_cmd =
+          gdraw_command_list_get_command(cmd_list, 5 + i);
+      GPoint p = gdraw_command_get_point(bump_cmd, 0);
+      bump_centers[i] = (GPoint){
+        .x = (int16_t)(p.x + s_logo_origin.x),
+        .y = (int16_t)(p.y + s_logo_origin.y),
+      };
+    }
+    GDrawCommand *cmd5 = gdraw_command_list_get_command(cmd_list, 5);
+    int32_t bump_r = gdraw_command_get_radius(cmd5);
+
+    // Compute the bump arc's angular half-span — the angle, measured
+    // from C_i, between the outward direction (toward V_i) and the
+    // V_{i+1}-side entry point on the bump perimeter. Same for all six
+    // bumps by symmetry, so compute once from V_0's geometry.
+    //
+    // Find the V_1-side entry by intersecting the V_0→V_1 line with
+    // the bump circle, then take its angle from C_0. atan2f(sin, cos)
+    // (i.e., atan2f(dx, -dy_screen)) yields the Pebble angle directly.
+    int32_t half_span;
+    {
+      GPoint vi    = s_hex_vertices[0];
+      GPoint vnext = s_hex_vertices[1];
+      GPoint ci    = bump_centers[0];
+      float ax = (float)(vnext.x - vi.x);
+      float ay = (float)(vnext.y - vi.y);
+      float bx = (float)(vi.x - ci.x);
+      float by = (float)(vi.y - ci.y);
+      float a_dot_a = ax * ax + ay * ay;
+      float a_dot_b = ax * bx + ay * by;
+      float b_dot_b = bx * bx + by * by;
+      float r2      = (float)(bump_r * bump_r);
+      float disc    = a_dot_b * a_dot_b - a_dot_a * (b_dot_b - r2);
+      float s       = (-a_dot_b + sqrtf(disc)) / a_dot_a;
+      float ex      = (float)vi.x + s * ax;
+      float ey      = (float)vi.y + s * ay;
+      float pebble_angle_rad =
+          atan2f(ex - (float)ci.x, (float)ci.y - ey);
+      half_span = (int32_t)(pebble_angle_rad
+                            * (float)TRIG_MAX_ANGLE
+                            / 6.28318530718f);
+    }
+
+    // Build the outside-(hex ∪ bumps) mask polygon. Outer screen rect
+    // is CW; inner hole traces the visible shape CCW (visiting hex
+    // vertices in reverse SVG order: 0, 5, 4, 3, 2, 1). At each V_i
+    // the polygon traces the bump's outer arc — centered on outward
+    // direction (i·60°), spanning ±half_span — as BUMP_ARC_SEGMENTS
+    // chord segments. Implicit straight lines between consecutive
+    // vertices' arcs form the hex edges with the bump cut off at each
+    // end.
+    s_outside_mask_points[0] =
+        (GPoint){ bounds.origin.x, bounds.origin.y };
+    s_outside_mask_points[1] =
+        (GPoint){ bounds.origin.x + bounds.size.w, bounds.origin.y };
+    s_outside_mask_points[2] =
+        (GPoint){ bounds.origin.x + bounds.size.w,
+                  bounds.origin.y + bounds.size.h };
+    s_outside_mask_points[3] =
+        (GPoint){ bounds.origin.x, bounds.origin.y + bounds.size.h };
+    s_outside_mask_points[4] = s_outside_mask_points[0];
+
+    static const int reverse_order[6] = { 0, 5, 4, 3, 2, 1 };
+    const int32_t arc_step = (-2 * half_span) / BUMP_ARC_SEGMENTS;
+    int idx = 5;
+    for (int n = 0; n < 6; n++) {
+      int i = reverse_order[n];
+      GPoint center = bump_centers[i];
+      int32_t outward = ((int32_t)i * TRIG_MAX_ANGLE) / 6;
+      int32_t start_angle = outward + half_span;
+      for (int k = 0; k < BUMP_ARC_POINTS; k++) {
+        int32_t a = start_angle + (int32_t)k * arc_step;
+        s_outside_mask_points[idx++] = (GPoint){
+          .x = (int16_t)(center.x +
+              (sin_lookup(a) * bump_r) / TRIG_MAX_RATIO),
+          .y = (int16_t)(center.y -
+              (cos_lookup(a) * bump_r) / TRIG_MAX_RATIO),
+        };
+      }
+    }
+    s_outside_mask_points[idx] = s_outside_mask_points[5];
   }
 
   s_face_layer = layer_create(bounds);
@@ -429,6 +507,25 @@ static void prv_window_unload(Window *window) {
     gdraw_command_image_destroy(s_hexagraph);
     s_hexagraph = NULL;
   }
+#ifdef PBL_PLATFORM_EMERY
+  if (s_stencil) {
+    gbitmap_destroy(s_stencil);
+    s_stencil = NULL;
+  }
+#endif
+}
+
+// AppMessage inbox handler — receives a Theme update from the Clay
+// config UI, persists it, and re-renders. Each key carries an int
+// 0..3 matching the ThemeColor enum values.
+static void inbox_received_handler(DictionaryIterator *iter, void *context) {
+  Tuple *t;
+  if ((t = dict_find(iter, MESSAGE_KEY_BG)))     s_theme.bg     = (uint8_t)t->value->int32;
+  if ((t = dict_find(iter, MESSAGE_KEY_LOGO)))   s_theme.logo   = (uint8_t)t->value->int32;
+  if ((t = dict_find(iter, MESSAGE_KEY_HOUR)))   s_theme.hour   = (uint8_t)t->value->int32;
+  if ((t = dict_find(iter, MESSAGE_KEY_MINUTE))) s_theme.minute = (uint8_t)t->value->int32;
+  theme_save();
+  if (s_face_layer) layer_mark_dirty(s_face_layer);
 }
 
 static void prv_init(void) {
@@ -442,6 +539,9 @@ static void prv_init(void) {
   });
   window_stack_push(s_window, true);
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
+
+  app_message_register_inbox_received(inbox_received_handler);
+  app_message_open(64, 64);
 }
 
 static void prv_deinit(void) {
