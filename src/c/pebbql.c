@@ -91,81 +91,46 @@ static GDrawCommandImage *s_hexagraph;
 // 100x100; we scale it once to fit the smallest screen dimension.
 static GPoint s_logo_origin;
 static GPoint s_logo_center;
-static int    s_logo_radius;            // center to hexagon corner, display px
-
-// Vertex circle geometry, matching the SVG (radius 8.82, centers at distance
-// 40.68 from origin in a 100-viewbox).
-static int    s_pdc_vertex_radius_px;
-static int    s_pdc_vertex_dist_px;
 
 #define LOGO_VIEWBOX        100
-// Distance from logo center to hexagon corner, in viewbox permil. The
-// SVG corners at (50, 6.9) → 43.1 from center (50, 50).
-#define LOGO_VERTEX_PERMIL  431
-// SVG vertex circles: r=8.82, centers at 40.68 from viewbox center (50, 50).
-#define VERTEX_RADIUS_PERMIL  88
-#define VERTEX_DIST_PERMIL   407
 
 // =====================================================================
-// Notch hand framework
+// Time markers — continuous angular sweep
 //
-// Each hand is a rotated rectangle drawn on top of the logo. The four
-// fields below control geometry independently — change one without
-// recomputing the others.
+// Hour and minute each have a continuous angular position (derived from
+// the time) and an angular half-width. The position swings around the
+// perimeter at the natural rate — hour: 360° / 12h = 30°/hour, minute:
+// 360° / 60min = 6°/min. The wedge is a triangle from the logo center
+// extending past the screen edge.
 //
-//   width_permil   tangential extent (along the hexagon edge), permil of
-//                  `target` (the logo bounding-box edge length). Permil-
-//                  of-target keeps visual size constant across platforms.
-//   height_permil  radial extent (perpendicular to the edge, inward
-//                  toward the logo center). Capped by ring thickness
-//                  (~42 permil at the thinnest spot); larger values
-//                  spill into the inner-triangle cutouts.
-//   angle_deg      rotation around the rect's center, degrees, +CW. At 0,
-//                  height runs along the inward normal and width runs
-//                  along the tangent (a tick perpendicular to the edge).
-//   inset_permil   shift the rect further inward from the perimeter. 0 =
-//                  outer face flush with the hexagon edge. Negative
-//                  pushes outward (spills onto background).
+// Render pipeline per frame:
+//   1. fill bg
+//   2. PDC pass 1 — outer hexagon only (others painted same color)
+//   3. wedges — drawn over the hex, also bleed past it onto bg
+//   4. outside-hex mask — polygon "screen rect with hexagonal hole"
+//      painted in bg, restoring bg outside the hex shape and confining
+//      the wedges to the hex's footprint
+//   5. PDC pass 2 — inner-triangle cutouts paint bg over the wedge in
+//      cutout areas (revealing the GraphQL pattern), vertex circles
+//      paint logo or wedge color depending on whether the wedge
+//      angularly covers them
+//
+// The mask polygon's hex hole uses the actual outer-hexagon vertices
+// from PDC cmd[0], so the geometry follows the SVG/PDC source of truth
+// without hand-derived constants.
 // =====================================================================
 
-typedef struct {
-  int width_permil;
-  int height_permil;
-  int angle_deg;
-  int inset_permil;
-} NotchSpec;
+// Wedge angular half-widths (degrees). Total wedge sweep = 2× this.
+//   Hour:  30° wedge. Sweep rate 30°/hour.
+//   Min:   10° wedge. Sweep rate 6°/min.
+#define HOUR_WEDGE_HALF_DEG   6
+#define MIN_WEDGE_HALF_DEG    3
 
-static const NotchSpec HOUR_NOTCH = {
-  .width_permil  = 60,
-  .height_permil = 80,
-  .angle_deg     = 0,
-  .inset_permil  = -20,
-};
-
-static const NotchSpec MIN_NOTCH = {
-  .width_permil  = 30,
-  .height_permil = 80,
-  .angle_deg     = 0,
-  .inset_permil  = -30,
-};
-
-// Resolved to display px once at window_load.
-typedef struct {
-  int width;
-  int height;
-  int angle_deg;
-  int inset;
-} NotchPx;
-
-static NotchPx s_hour;
-static NotchPx s_min;
-
-// Glow-trigger threshold: the rect "expands" to fill the vertex circle only
-// when the perim is essentially AT a vertex (~2 px). The minute hand moves
-// ~6.7 px/min on chalk so this fires only at exact 10-min ticks; the hour
-// hand moves ~0.56 px/min so it fires for a few minutes around each even
-// hour. Anywhere else the notch reads as a plain rectangle.
-#define VERTEX_NEAR_PX         2
+static int     s_far_distance_px;       // wedge outer-corner distance, past screen
+static int32_t s_hour_half_width;       // Pebble angle units
+static int32_t s_min_half_width;
+static GPoint  s_hex_vertices[6];       // outer hexagon corners, screen coords
+static GRect   s_screen_bounds;         // for the outside-hex mask polygon
 
 #define LOGO_MARGIN          12
 
@@ -196,138 +161,106 @@ static bool scale_cb(GDrawCommand *cmd, uint32_t index, void *ctx) {
   return true;
 }
 
-// PDC recoloring: outer hexagon and vertex circles take the logo color;
-// inner triangles take the bg color so they "cut out" of the hexagon by
-// drawing the bg on top, replicating the SVG's evenodd fill rule via
-// pure layering.
-typedef struct { GColor logo; GColor bg; } RecolorCtx;
+// PDC pass 1: paint everything in the logo color so only the outer
+// hexagon shape appears (cutouts and vertex circles overdraw the same
+// color, no visible effect). Edge highlights drawn after this pass sit
+// on top of a clean filled hexagon, ready to be clipped by pass 2.
+// Also unhides any command that pass 2 may have hidden last frame.
+typedef struct { GColor logo; } RecolorPass1Ctx;
 
-static bool recolor_cb(GDrawCommand *cmd, uint32_t index, void *ctx_) {
-  RecolorCtx *ctx = ctx_;
-  bool is_cutout = (index >= HEX_PDC_INNER_FIRST && index <= HEX_PDC_INNER_LAST);
-  gdraw_command_set_fill_color(cmd, is_cutout ? ctx->bg : ctx->logo);
+static bool recolor_pass1_cb(GDrawCommand *cmd, uint32_t index, void *ctx_) {
+  RecolorPass1Ctx *ctx = ctx_;
+  gdraw_command_set_hidden(cmd, false);
+  gdraw_command_set_fill_color(cmd, ctx->logo);
   return true;
 }
 
-static GPoint hex_vertex(int i) {
-  int32_t angle = (i * TRIG_MAX_ANGLE) / 6;
-  return (GPoint) {
-    .x = s_logo_center.x + (int16_t)((sin_lookup(angle) * s_logo_radius) / TRIG_MAX_RATIO),
-    .y = s_logo_center.y - (int16_t)((cos_lookup(angle) * s_logo_radius) / TRIG_MAX_RATIO),
-  };
+// Returns true when angle `a` lies within `half_width` of `center`
+// (using the shortest signed difference, mod TRIG_MAX_ANGLE).
+static bool angle_within(int32_t a, int32_t center, int32_t half_width) {
+  int32_t d = a - center;
+  while (d < 0) d += TRIG_MAX_ANGLE;
+  while (d >= TRIG_MAX_ANGLE) d -= TRIG_MAX_ANGLE;
+  if (d > TRIG_MAX_ANGLE / 2) d = TRIG_MAX_ANGLE - d;
+  return d <= half_width;
 }
 
-// Vertex circle centers sit slightly inward of the hexagon corners — the
-// "bumps" in the hexagraph. Anchors the vertex glow to the PDC circles so
-// it overlays them exactly.
-static GPoint pdc_vertex_center(int i) {
-  int32_t angle = (i * TRIG_MAX_ANGLE) / 6;
-  return (GPoint) {
-    .x = s_logo_center.x + (int16_t)((sin_lookup(angle) * s_pdc_vertex_dist_px) / TRIG_MAX_RATIO),
-    .y = s_logo_center.y - (int16_t)((cos_lookup(angle) * s_pdc_vertex_dist_px) / TRIG_MAX_RATIO),
-  };
-}
-
-// Position on hexagon perimeter at fraction = num/den, walking clockwise
-// from the top vertex. Reports the side index (0..5) for orientation, plus
-// the (t, den) along that side for proximity checks.
+// PDC pass 2: cutouts paint bg over the wedges drawn between passes
+// (clipping them to the visible white petal regions); vertex circles
+// paint hour/min color when their angle is inside the corresponding
+// wedge, else logo. The outer hexagon is hidden — pass 1 drew it.
 typedef struct {
-  GPoint  pos;
-  int     side;
-  int32_t t;
-  int32_t den;
-} PerimResult;
+  GColor  logo;
+  GColor  bg;
+  int32_t hour_angle;
+  int32_t hour_half_width;
+  GColor  hour_color;
+  int32_t min_angle;
+  int32_t min_half_width;
+  GColor  min_color;
+} RecolorPass2Ctx;
 
-static PerimResult perim_at(int32_t num, int32_t den) {
-  int32_t scaled = num * 6;
-  int side = scaled / den;
-  if (side >= 6) side = 5;
-  int32_t t = scaled - (int32_t)side * den;
-
-  GPoint a = hex_vertex(side);
-  GPoint b = hex_vertex((side + 1) % 6);
-  return (PerimResult) {
-    .pos = (GPoint) {
-      .x = a.x + (int16_t)(((int32_t)(b.x - a.x) * t) / den),
-      .y = a.y + (int16_t)(((int32_t)(b.y - a.y) * t) / den),
-    },
-    .side = side,
-    .t    = t,
-    .den  = den,
-  };
+static bool recolor_pass2_cb(GDrawCommand *cmd, uint32_t index, void *ctx_) {
+  RecolorPass2Ctx *ctx = ctx_;
+  // Make the outer hexagon transparent so it doesn't repaint over the
+  // wedges drawn after pass 1. (gdraw_command_set_hidden appears to be
+  // a no-op for path commands in this SDK; GColorClear is reliable.)
+  if (index == 0) {
+    gdraw_command_set_fill_color(cmd, GColorClear);
+    return true;
+  }
+  if (index >= HEX_PDC_INNER_FIRST && index <= HEX_PDC_INNER_LAST) {
+    gdraw_command_set_fill_color(cmd, ctx->bg);
+    return true;
+  }
+  // Vertex circles at indices 5..10. Min checked first so it wins when
+  // both wedges cover the same vertex (matching min-on-top layering).
+  if (index >= 5 && index <= 10) {
+    int v = (int)index - 5;
+    int32_t va = (int32_t)v * (TRIG_MAX_ANGLE / 6);
+    if (angle_within(va, ctx->min_angle, ctx->min_half_width)) {
+      gdraw_command_set_fill_color(cmd, ctx->min_color);
+      return true;
+    }
+    if (angle_within(va, ctx->hour_angle, ctx->hour_half_width)) {
+      gdraw_command_set_fill_color(cmd, ctx->hour_color);
+      return true;
+    }
+  }
+  gdraw_command_set_fill_color(cmd, ctx->logo);
+  return true;
 }
 
-// If perim is within `near_dist_px` of either endpoint of its side, returns
-// the vertex index (0..5); else -1. Edge length == s_logo_radius for a
-// regular hexagon, so along-edge distance scales linearly with t.
-static int near_vertex(const PerimResult *p, int near_dist_px) {
-  int32_t dist_to_start = (p->t * s_logo_radius) / p->den;
-  if (dist_to_start < near_dist_px) return p->side;
-  int32_t dist_to_end = ((p->den - p->t) * s_logo_radius) / p->den;
-  if (dist_to_end < near_dist_px) return (p->side + 1) % 6;
-  return -1;
+// Time → angular position. Hour completes 360° in 12h, minute in 60min.
+// Both expressed in Pebble angle units (TRIG_MAX_ANGLE = full circle).
+static int32_t hour_angle_at(int hour12, int minute) {
+  return ((int32_t)(hour12 * 60 + minute) * TRIG_MAX_ANGLE) / (12 * 60);
 }
 
-// Draw a notch on the local hexagon edge per the spec. Edge length ==
-// s_logo_radius for a regular hexagon, so the tangent/normal basis is
-// computed without sqrt. Local frame: +x along the edge tangent, +y
-// pointing inward toward the logo center.
-//
-// Layout: rect is centered at `anchor + (hh + inset)·n_hat` (i.e. the
-// rect's outer face is flush with the edge at inset=0). Rotation pivots
-// around the rect's own center, so adjusting `angle_deg` doesn't move
-// the notch radially.
-static void draw_notch(GContext *ctx, GPoint anchor, int side,
-                       const NotchPx *spec, GColor color) {
-  GPoint a = hex_vertex(side);
-  GPoint b = hex_vertex((side + 1) % 6);
+static int32_t minute_angle_at(int minute) {
+  return ((int32_t)minute * TRIG_MAX_ANGLE) / 60;
+}
 
-  int32_t tx = ((int32_t)(b.x - a.x) * 256) / s_logo_radius;
-  int32_t ty = ((int32_t)(b.y - a.y) * 256) / s_logo_radius;
-  int32_t nx = -ty;
-  int32_t ny =  tx;
-  // Flip if the normal happened to point outward (away from logo center).
-  int32_t to_center_x = s_logo_center.x - anchor.x;
-  int32_t to_center_y = s_logo_center.y - anchor.y;
-  if (nx * to_center_x + ny * to_center_y < 0) {
-    nx = -nx;
-    ny = -ny;
-  }
+// Draw a wedge: a triangle from the logo center out to two corners
+// past the screen edge, at angles center ± half_width. The corners are
+// far enough out that the triangle reaches the screen edge in any
+// direction; the rasterizer clips the parts off-screen for free.
+static void draw_wedge(GContext *ctx, int32_t center, int32_t half_width,
+                       GColor color) {
+  int32_t theta1 = center - half_width;
+  int32_t theta2 = center + half_width;
 
-  int hw = spec->width  / 2;
-  int hh = spec->height / 2;
-  int center_offset = hh + spec->inset;
-
-  int32_t angle = (int32_t)spec->angle_deg * TRIG_MAX_ANGLE / 360;
-  int32_t cos_a = cos_lookup(angle);
-  int32_t sin_a = sin_lookup(angle);
-
-  // Rect corners in local frame, centered at origin.
-  int local[4][2] = {
-    { -hw, -hh },
-    {  hw, -hh },
-    {  hw,  hh },
-    { -hw,  hh },
+  GPoint p1 = {
+    .x = s_logo_center.x + (int16_t)((sin_lookup(theta1) * s_far_distance_px) / TRIG_MAX_RATIO),
+    .y = s_logo_center.y - (int16_t)((cos_lookup(theta1) * s_far_distance_px) / TRIG_MAX_RATIO),
+  };
+  GPoint p2 = {
+    .x = s_logo_center.x + (int16_t)((sin_lookup(theta2) * s_far_distance_px) / TRIG_MAX_RATIO),
+    .y = s_logo_center.y - (int16_t)((cos_lookup(theta2) * s_far_distance_px) / TRIG_MAX_RATIO),
   };
 
-  GPoint corners[4];
-  for (int i = 0; i < 4; i++) {
-    int32_t lx = local[i][0];
-    int32_t ly = local[i][1];
-    // Rotate around rect center, then slide center inward from anchor.
-    int32_t rx = (lx * cos_a - ly * sin_a) / TRIG_MAX_RATIO;
-    int32_t ry = (lx * sin_a + ly * cos_a) / TRIG_MAX_RATIO;
-    ry += center_offset;
-    // Map (rx, ry) to world via tangent/normal basis (both *256).
-    int32_t wx = (rx * tx + ry * nx) / 256;
-    int32_t wy = (rx * ty + ry * ny) / 256;
-    corners[i] = (GPoint){
-      (int16_t)(anchor.x + wx),
-      (int16_t)(anchor.y + wy),
-    };
-  }
-
-  GPathInfo info = { .num_points = 4, .points = corners };
+  GPoint corners[3] = { s_logo_center, p1, p2 };
+  GPathInfo info = { .num_points = 3, .points = corners };
   GPath *path = gpath_create(&info);
   if (path) {
     graphics_context_set_fill_color(ctx, color);
@@ -336,68 +269,95 @@ static void draw_notch(GContext *ctx, GPoint anchor, int side,
   }
 }
 
-static void draw_time_markers(GContext *ctx, struct tm *t, GColor bg) {
-  int hour12 = t->tm_hour % 12;
-  int minute = t->tm_min;
+// Paints `color` over everything outside the outer hexagon. Uses the
+// non-zero winding rule to fill the area between an outer screen-rect
+// (CW) and an inner hex hole (CCW). The two duplicate vertices form a
+// degenerate "tunnel" between the two loops that cancels itself out.
+static void draw_outside_hex(GContext *ctx, GColor color) {
+  GPoint mask[12];
+  // Outer screen rectangle, CW from top-left.
+  mask[0] = (GPoint){ s_screen_bounds.origin.x,
+                      s_screen_bounds.origin.y };
+  mask[1] = (GPoint){ s_screen_bounds.origin.x + s_screen_bounds.size.w,
+                      s_screen_bounds.origin.y };
+  mask[2] = (GPoint){ s_screen_bounds.origin.x + s_screen_bounds.size.w,
+                      s_screen_bounds.origin.y + s_screen_bounds.size.h };
+  mask[3] = (GPoint){ s_screen_bounds.origin.x,
+                      s_screen_bounds.origin.y + s_screen_bounds.size.h };
+  mask[4] = mask[0];                  // close outer loop
+  // Inner hex hole — opposite winding to the outer, so the "between"
+  // area fills under the non-zero rule.
+  mask[5]  = s_hex_vertices[0];       // tunnel into the hole
+  mask[6]  = s_hex_vertices[5];
+  mask[7]  = s_hex_vertices[4];
+  mask[8]  = s_hex_vertices[3];
+  mask[9]  = s_hex_vertices[2];
+  mask[10] = s_hex_vertices[1];
+  mask[11] = s_hex_vertices[0];       // close inner loop; implicit
+                                      // close to mask[0] is the tunnel
+                                      // out — same line as mask[4]→[5],
+                                      // so they cancel.
 
-  // Hour notch creeps smoothly between hour positions as minutes pass:
-  // fraction = (h*60 + m) / (12*60).
-  PerimResult hour_p = perim_at(hour12 * 60 + minute, 720);
-  PerimResult min_p  = perim_at(minute, 60);
-
-  GColor hour_color   = color_notch(s_theme.hour,   s_theme.bg);
-  GColor minute_color = color_notch(s_theme.minute, s_theme.bg);
-
-  int hv = near_vertex(&hour_p, VERTEX_NEAR_PX);
-  int mv = near_vertex(&min_p,  VERTEX_NEAR_PX);
-
-  // Layered: hour, then a 1-px bg halo grown around the minute spec, then
-  // the minute on top. The halo keeps the two shapes distinct when they
-  // overlap — necessary on monochrome where both notch colors collapse.
-  draw_notch(ctx, hour_p.pos, hour_p.side, &s_hour, hour_color);
-
-  NotchPx min_halo = s_min;
-  min_halo.width  += 2;
-  min_halo.height += 2;
-  draw_notch(ctx, min_p.pos, min_p.side, &min_halo, bg);
-  draw_notch(ctx, min_p.pos, min_p.side, &s_min, minute_color);
-
-  // Vertex glows: notch color fills the vertex circle bump when the hand
-  // lands at an exact tick. Minute halo only when sharing a corner with
-  // the hour, so isolated minute glows don't get a bg ring.
-  if (hv >= 0) {
-    graphics_context_set_fill_color(ctx, hour_color);
-    graphics_fill_circle(ctx, pdc_vertex_center(hv), s_pdc_vertex_radius_px);
-  }
-  if (mv >= 0) {
-    if (hv == mv) {
-      graphics_context_set_fill_color(ctx, bg);
-      graphics_fill_circle(ctx, pdc_vertex_center(mv), s_pdc_vertex_radius_px + 1);
-    }
-    graphics_context_set_fill_color(ctx, minute_color);
-    graphics_fill_circle(ctx, pdc_vertex_center(mv), s_pdc_vertex_radius_px);
+  GPathInfo info = { .num_points = 12, .points = mask };
+  GPath *path = gpath_create(&info);
+  if (path) {
+    graphics_context_set_fill_color(ctx, color);
+    gpath_draw_filled(ctx, path);
+    gpath_destroy(path);
   }
 }
 
 static void face_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
-  GColor logo_color = color_logo(s_theme.logo, s_theme.bg);
-  GColor bg         = color_bg(s_theme.bg);
+  GColor logo = color_logo(s_theme.logo, s_theme.bg);
+  GColor bg   = color_bg(s_theme.bg);
 
   graphics_context_set_fill_color(ctx, bg);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
-  if (s_hexagraph) {
-    RecolorCtx rc = { .logo = logo_color, .bg = bg };
-    gdraw_command_list_iterate(
-      gdraw_command_image_get_command_list(s_hexagraph), recolor_cb, &rc);
-    gdraw_command_image_draw(ctx, s_hexagraph, s_logo_origin);
+  if (!s_hexagraph) return;
 
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    draw_time_markers(ctx, t, bg);
-  }
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  int32_t ha = hour_angle_at(t->tm_hour % 12, t->tm_min);
+  int32_t ma = minute_angle_at(t->tm_min);
+
+  GColor hour_color = color_notch(s_theme.hour,   s_theme.bg);
+  GColor min_color  = color_notch(s_theme.minute, s_theme.bg);
+
+  GDrawCommandList *cmds = gdraw_command_image_get_command_list(s_hexagraph);
+
+  // Pass 1: outer hexagon only — cutouts and vertex circles painted in
+  // logo color, so they overdraw to no visible effect.
+  RecolorPass1Ctx rc1 = { .logo = logo };
+  gdraw_command_list_iterate(cmds, recolor_pass1_cb, &rc1);
+  gdraw_command_image_draw(ctx, s_hexagraph, s_logo_origin);
+
+  // Hour wedge, then minute wedge on top. Both bleed past the hex
+  // onto the surrounding bg; the next step trims that bleed.
+  draw_wedge(ctx, ha, s_hour_half_width, hour_color);
+  draw_wedge(ctx, ma, s_min_half_width,  min_color);
+
+  // Mask: paint bg over everything outside the hex shape, confining
+  // the wedges to the hex's footprint.
+  draw_outside_hex(ctx, bg);
+
+  // Pass 2: cutouts mask the wedges to the visible petals; vertex
+  // circles take the wedge color when the wedge angularly covers them
+  // so the bumps participate in the sweep.
+  RecolorPass2Ctx rc2 = {
+    .logo            = logo,
+    .bg              = bg,
+    .hour_angle      = ha,
+    .hour_half_width = s_hour_half_width,
+    .hour_color      = hour_color,
+    .min_angle       = ma,
+    .min_half_width  = s_min_half_width,
+    .min_color       = min_color,
+  };
+  gdraw_command_list_iterate(cmds, recolor_pass2_cb, &rc2);
+  gdraw_command_image_draw(ctx, s_hexagraph, s_logo_origin);
 }
 
 static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
@@ -426,22 +386,36 @@ static void prv_window_load(Window *window) {
       s_logo_origin.x + target / 2,
       s_logo_origin.y + target / 2,
     };
-    s_logo_radius          = (target * LOGO_VERTEX_PERMIL)  / 1000;
-    s_pdc_vertex_radius_px = (target * VERTEX_RADIUS_PERMIL) / 1000;
-    s_pdc_vertex_dist_px   = (target * VERTEX_DIST_PERMIL)   / 1000;
+    // Wedge outer corners sit this far from the logo center — past the
+    // screen edge in every direction. (Sum of the two screen dimensions
+    // is always > the diagonal, so the wedge corners are always
+    // off-screen and the rasterizer clips for free.)
+    s_far_distance_px = bounds.size.w + bounds.size.h;
 
-    s_hour = (NotchPx){
-      .width     = (target * HOUR_NOTCH.width_permil)  / 1000,
-      .height    = (target * HOUR_NOTCH.height_permil) / 1000,
-      .angle_deg = HOUR_NOTCH.angle_deg,
-      .inset     = (target * HOUR_NOTCH.inset_permil)  / 1000,
-    };
-    s_min = (NotchPx){
-      .width     = (target * MIN_NOTCH.width_permil)  / 1000,
-      .height    = (target * MIN_NOTCH.height_permil) / 1000,
-      .angle_deg = MIN_NOTCH.angle_deg,
-      .inset     = (target * MIN_NOTCH.inset_permil)  / 1000,
-    };
+    s_hour_half_width =
+        ((int32_t)HOUR_WEDGE_HALF_DEG * TRIG_MAX_ANGLE) / 360;
+    s_min_half_width  =
+        ((int32_t)MIN_WEDGE_HALF_DEG  * TRIG_MAX_ANGLE) / 360;
+
+    // Read the actual outer-hexagon corners from PDC cmd[0] (the path
+    // is in PDC-local coords post-scale_cb; offset by s_logo_origin to
+    // get screen coords). This is the source of truth for the hex
+    // shape — the mask polygon below uses it to confine wedges to the
+    // hex footprint without hand-derived geometry.
+    //
+    // svg2pdc stores 7 points for the hex path: index 0 is the SVG
+    // Move's start (a duplicate of vertex 0), indices 1..6 are the
+    // six hex corners. So we skip index 0.
+    GDrawCommand *cmd0 = gdraw_command_list_get_command(
+        gdraw_command_image_get_command_list(s_hexagraph), 0);
+    for (int i = 0; i < 6; i++) {
+      GPoint p = gdraw_command_get_point(cmd0, i + 1);
+      s_hex_vertices[i] = (GPoint){
+        .x = (int16_t)(p.x + s_logo_origin.x),
+        .y = (int16_t)(p.y + s_logo_origin.y),
+      };
+    }
+    s_screen_bounds = bounds;
   }
 
   s_face_layer = layer_create(bounds);
