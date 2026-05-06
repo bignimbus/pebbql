@@ -98,11 +98,6 @@ static int    s_logo_radius;            // center to hexagon corner, display px
 static int    s_pdc_vertex_radius_px;
 static int    s_pdc_vertex_dist_px;
 
-// Notch dimensions in display px.
-static int    s_hour_half_t;
-static int    s_min_half_t;
-static int    s_notch_full_radial;
-
 #define LOGO_VIEWBOX        100
 // Distance from logo center to hexagon corner, in viewbox permil. The
 // SVG corners at (50, 6.9) → 43.1 from center (50, 50).
@@ -111,14 +106,59 @@ static int    s_notch_full_radial;
 #define VERTEX_RADIUS_PERMIL  88
 #define VERTEX_DIST_PERMIL   407
 
-// Notch sizes in permil of target. Tangential cap of ~74 permil keeps the
-// rect inside the vertex circle when the perim sits at a corner — beyond
-// that the rect spills into the bg outside the logo. Radial cap of ~42
-// permil keeps the rect inside the ring (which is ~4.2 viewbox units thick
-// at the thinnest spot), so it never reaches the inner-triangle cutouts.
-#define HOUR_HALF_T_PERMIL    70
-#define MIN_HALF_T_PERMIL     55
-#define NOTCH_FULL_R_PERMIL   35
+// =====================================================================
+// Notch hand framework
+//
+// Each hand is a rotated rectangle drawn on top of the logo. The four
+// fields below control geometry independently — change one without
+// recomputing the others.
+//
+//   width_permil   tangential extent (along the hexagon edge), permil of
+//                  `target` (the logo bounding-box edge length). Permil-
+//                  of-target keeps visual size constant across platforms.
+//   height_permil  radial extent (perpendicular to the edge, inward
+//                  toward the logo center). Capped by ring thickness
+//                  (~42 permil at the thinnest spot); larger values
+//                  spill into the inner-triangle cutouts.
+//   angle_deg      rotation around the rect's center, degrees, +CW. At 0,
+//                  height runs along the inward normal and width runs
+//                  along the tangent (a tick perpendicular to the edge).
+//   inset_permil   shift the rect further inward from the perimeter. 0 =
+//                  outer face flush with the hexagon edge. Negative
+//                  pushes outward (spills onto background).
+// =====================================================================
+
+typedef struct {
+  int width_permil;
+  int height_permil;
+  int angle_deg;
+  int inset_permil;
+} NotchSpec;
+
+static const NotchSpec HOUR_NOTCH = {
+  .width_permil  = 60,
+  .height_permil = 80,
+  .angle_deg     = 0,
+  .inset_permil  = -20,
+};
+
+static const NotchSpec MIN_NOTCH = {
+  .width_permil  = 30,
+  .height_permil = 80,
+  .angle_deg     = 0,
+  .inset_permil  = -30,
+};
+
+// Resolved to display px once at window_load.
+typedef struct {
+  int width;
+  int height;
+  int angle_deg;
+  int inset;
+} NotchPx;
+
+static NotchPx s_hour;
+static NotchPx s_min;
 
 // Glow-trigger threshold: the rect "expands" to fill the vertex circle only
 // when the perim is essentially AT a vertex (~2 px). The minute hand moves
@@ -228,37 +268,64 @@ static int near_vertex(const PerimResult *p, int near_dist_px) {
   return -1;
 }
 
-// Draw a rectangle aligned to the local hexagon edge, with one long side
-// flush against the perimeter (extending only inward). Fixed-point tangent
-// + inward-normal vectors; edge length == s_logo_radius for a regular
-// hexagon, so we sidestep sqrt.
-static void draw_notch_rect(GContext *ctx, GPoint perim, int side,
-                            int half_t, int full_r, GColor color) {
+// Draw a notch on the local hexagon edge per the spec. Edge length ==
+// s_logo_radius for a regular hexagon, so the tangent/normal basis is
+// computed without sqrt. Local frame: +x along the edge tangent, +y
+// pointing inward toward the logo center.
+//
+// Layout: rect is centered at `anchor + (hh + inset)·n_hat` (i.e. the
+// rect's outer face is flush with the edge at inset=0). Rotation pivots
+// around the rect's own center, so adjusting `angle_deg` doesn't move
+// the notch radially.
+static void draw_notch(GContext *ctx, GPoint anchor, int side,
+                       const NotchPx *spec, GColor color) {
   GPoint a = hex_vertex(side);
   GPoint b = hex_vertex((side + 1) % 6);
 
   int32_t tx = ((int32_t)(b.x - a.x) * 256) / s_logo_radius;
   int32_t ty = ((int32_t)(b.y - a.y) * 256) / s_logo_radius;
   int32_t nx = -ty;
-  int32_t ny = tx;
+  int32_t ny =  tx;
   // Flip if the normal happened to point outward (away from logo center).
-  int32_t to_center_x = s_logo_center.x - perim.x;
-  int32_t to_center_y = s_logo_center.y - perim.y;
+  int32_t to_center_x = s_logo_center.x - anchor.x;
+  int32_t to_center_y = s_logo_center.y - anchor.y;
   if (nx * to_center_x + ny * to_center_y < 0) {
     nx = -nx;
     ny = -ny;
   }
 
-  GPoint corners[4] = {
-    { (int16_t)(perim.x + ((tx * (-half_t)) / 256)),
-      (int16_t)(perim.y + ((ty * (-half_t)) / 256)) },
-    { (int16_t)(perim.x + ((tx *  half_t)  / 256)),
-      (int16_t)(perim.y + ((ty *  half_t)  / 256)) },
-    { (int16_t)(perim.x + ((tx *  half_t  + nx * full_r) / 256)),
-      (int16_t)(perim.y + ((ty *  half_t  + ny * full_r) / 256)) },
-    { (int16_t)(perim.x + ((tx * (-half_t) + nx * full_r) / 256)),
-      (int16_t)(perim.y + ((ty * (-half_t) + ny * full_r) / 256)) },
+  int hw = spec->width  / 2;
+  int hh = spec->height / 2;
+  int center_offset = hh + spec->inset;
+
+  int32_t angle = (int32_t)spec->angle_deg * TRIG_MAX_ANGLE / 360;
+  int32_t cos_a = cos_lookup(angle);
+  int32_t sin_a = sin_lookup(angle);
+
+  // Rect corners in local frame, centered at origin.
+  int local[4][2] = {
+    { -hw, -hh },
+    {  hw, -hh },
+    {  hw,  hh },
+    { -hw,  hh },
   };
+
+  GPoint corners[4];
+  for (int i = 0; i < 4; i++) {
+    int32_t lx = local[i][0];
+    int32_t ly = local[i][1];
+    // Rotate around rect center, then slide center inward from anchor.
+    int32_t rx = (lx * cos_a - ly * sin_a) / TRIG_MAX_RATIO;
+    int32_t ry = (lx * sin_a + ly * cos_a) / TRIG_MAX_RATIO;
+    ry += center_offset;
+    // Map (rx, ry) to world via tangent/normal basis (both *256).
+    int32_t wx = (rx * tx + ry * nx) / 256;
+    int32_t wy = (rx * ty + ry * ny) / 256;
+    corners[i] = (GPoint){
+      (int16_t)(anchor.x + wx),
+      (int16_t)(anchor.y + wy),
+    };
+  }
 
   GPathInfo info = { .num_points = 4, .points = corners };
   GPath *path = gpath_create(&info);
@@ -281,19 +348,19 @@ static void draw_time_markers(GContext *ctx, struct tm *t, GColor bg) {
   GColor hour_color   = color_notch(s_theme.hour,   s_theme.bg);
   GColor minute_color = color_notch(s_theme.minute, s_theme.bg);
 
-  // Glow only when the perim is essentially AT a vertex — see comment on
-  // VERTEX_NEAR_PX. Most of the time both hands read as rectangles.
   int hv = near_vertex(&hour_p, VERTEX_NEAR_PX);
   int mv = near_vertex(&min_p,  VERTEX_NEAR_PX);
 
-  // Rectangles, layered hour-then-minute. A bg halo around the minute keeps
-  // the two notches distinct when they overlap (especially on monochrome).
-  draw_notch_rect(ctx, hour_p.pos, hour_p.side,
-                  s_hour_half_t, s_notch_full_radial, hour_color);
-  draw_notch_rect(ctx, min_p.pos, min_p.side,
-                  s_min_half_t + 1, s_notch_full_radial + 1, bg);
-  draw_notch_rect(ctx, min_p.pos, min_p.side,
-                  s_min_half_t, s_notch_full_radial, minute_color);
+  // Layered: hour, then a 1-px bg halo grown around the minute spec, then
+  // the minute on top. The halo keeps the two shapes distinct when they
+  // overlap — necessary on monochrome where both notch colors collapse.
+  draw_notch(ctx, hour_p.pos, hour_p.side, &s_hour, hour_color);
+
+  NotchPx min_halo = s_min;
+  min_halo.width  += 2;
+  min_halo.height += 2;
+  draw_notch(ctx, min_p.pos, min_p.side, &min_halo, bg);
+  draw_notch(ctx, min_p.pos, min_p.side, &s_min, minute_color);
 
   // Vertex glows: notch color fills the vertex circle bump when the hand
   // lands at an exact tick. Minute halo only when sharing a corner with
@@ -362,9 +429,19 @@ static void prv_window_load(Window *window) {
     s_logo_radius          = (target * LOGO_VERTEX_PERMIL)  / 1000;
     s_pdc_vertex_radius_px = (target * VERTEX_RADIUS_PERMIL) / 1000;
     s_pdc_vertex_dist_px   = (target * VERTEX_DIST_PERMIL)   / 1000;
-    s_hour_half_t          = (target * HOUR_HALF_T_PERMIL)   / 1000;
-    s_min_half_t           = (target * MIN_HALF_T_PERMIL)    / 1000;
-    s_notch_full_radial    = (target * NOTCH_FULL_R_PERMIL)  / 1000;
+
+    s_hour = (NotchPx){
+      .width     = (target * HOUR_NOTCH.width_permil)  / 1000,
+      .height    = (target * HOUR_NOTCH.height_permil) / 1000,
+      .angle_deg = HOUR_NOTCH.angle_deg,
+      .inset     = (target * HOUR_NOTCH.inset_permil)  / 1000,
+    };
+    s_min = (NotchPx){
+      .width     = (target * MIN_NOTCH.width_permil)  / 1000,
+      .height    = (target * MIN_NOTCH.height_permil) / 1000,
+      .angle_deg = MIN_NOTCH.angle_deg,
+      .inset     = (target * MIN_NOTCH.inset_permil)  / 1000,
+    };
   }
 
   s_face_layer = layer_create(bounds);
