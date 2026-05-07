@@ -23,10 +23,7 @@
       "watchface": true
     },
     "messageKeys": [
-      "BG",
-      "LOGO",
-      "HOUR",
-      "MINUTE"
+      "DARK"
     ],
     "resources": {
       "media": [
@@ -34,12 +31,6 @@
           "type": "raw",
           "name": "HEXAGRAPH_PDC",
           "file": "hexagraph.pdc"
-        },
-        {
-          "type": "bitmap",
-          "name": "STENCIL",
-          "file": "stencil_emery.png",
-          "targetPlatforms": ["emery"]
         }
       ]
     }
