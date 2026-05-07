@@ -1,5 +1,4 @@
 #include <pebble.h>
-#include <math.h>
 
 // =====================================================================
 // Theme: tokens persisted to storage, resolved to GColor at draw time.
@@ -424,37 +423,25 @@ static void prv_window_load(Window *window) {
     GDrawCommand *cmd5 = gdraw_command_list_get_command(cmd_list, 5);
     int32_t bump_r = gdraw_command_get_radius(cmd5);
 
-    // Compute the bump arc's angular half-span — the angle, measured
-    // from C_i, between the outward direction (toward V_i) and the
-    // V_{i+1}-side entry point on the bump perimeter. Same for all six
-    // bumps by symmetry, so compute once from V_0's geometry.
+    // Bump arc's angular half-span — the angle, measured from C_i,
+    // between the outward direction (toward V_i) and a hex edge's
+    // intersection with the bump perimeter. Same for all six bumps by
+    // symmetry; depends only on d/r and the hex interior angle, all
+    // fixed by the SVG geometry, so it's a compile-time constant.
     //
-    // Find the V_1-side entry by intersecting the V_0→V_1 line with
-    // the bump circle, then take its angle from C_0. atan2f(sin, cos)
-    // (i.e., atan2f(dx, -dy_screen)) yields the Pebble angle directly.
-    int32_t half_span;
-    {
-      GPoint vi    = s_hex_vertices[0];
-      GPoint vnext = s_hex_vertices[1];
-      GPoint ci    = bump_centers[0];
-      float ax = (float)(vnext.x - vi.x);
-      float ay = (float)(vnext.y - vi.y);
-      float bx = (float)(vi.x - ci.x);
-      float by = (float)(vi.y - ci.y);
-      float a_dot_a = ax * ax + ay * ay;
-      float a_dot_b = ax * bx + ay * by;
-      float b_dot_b = bx * bx + by * by;
-      float r2      = (float)(bump_r * bump_r);
-      float disc    = a_dot_b * a_dot_b - a_dot_a * (b_dot_b - r2);
-      float s       = (-a_dot_b + sqrtf(disc)) / a_dot_a;
-      float ex      = (float)vi.x + s * ax;
-      float ey      = (float)vi.y + s * ay;
-      float pebble_angle_rad =
-          atan2f(ex - (float)ci.x, (float)ci.y - ey);
-      half_span = (int32_t)(pebble_angle_rad
-                            * (float)TRIG_MAX_ANGLE
-                            / 6.28318530718f);
-    }
+    // Derivation: in triangle (C_i, V_i, P_entry) the angle at V_i
+    // is 180°-hex_interior = 60°. Law of sines gives
+    //   half_span = 120° - asin(d * sin(60°) / r)
+    // where d = |V_i - C_i| ≈ 2.42, r = bump radius ≈ 8.82, both in
+    // viewbox units. ratio = 0.274·sin(60°) ≈ 0.237; asin(0.237) ≈
+    // 13.7°; half_span ≈ 106.3°. In Pebble angle units (full circle
+    // = TRIG_MAX_ANGLE = 65536), 106.3° ≈ 19345.
+    //
+    // Hardcoded rather than computed because Pebble Time 2 (emery)
+    // hardware faults inside the SDK's __ieee754_sqrtf, even though
+    // the same code runs fine in the emery emulator.
+    const int32_t half_span = 19345;
+    (void)bump_r;  // still read for future reference but unused here
 
     // Build the outside-(hex ∪ bumps) mask polygon. Outer screen rect
     // is CW; inner hole traces the visible shape CCW (visiting hex
