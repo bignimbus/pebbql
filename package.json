@@ -1,12 +1,8 @@
 {
   "name": "pebbql",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": " GraphQL-themed Pebble watchface",
-  "author": {
-    "name": "Jeff Auriemma",
-    "email": "bignimbus@users.noreply.github.com",
-    "url": "https://github.com/bignimbus"
-  },
+  "author": "Jeff Auriemma",
   "license": "MIT",
   "homepage": "https://github.com/bignimbus/pebbql",
   "repository": {
