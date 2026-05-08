@@ -1,8 +1,22 @@
 {
   "name": "pebbql",
-  "author": "MakeAwesomeHappen",
-  "version": "1.0.0",
-  "keywords": ["pebble-app"],
+  "version": "1.0.1",
+  "description": " GraphQL-themed Pebble watchface",
+  "author": {
+    "name": "Jeff Auriemma",
+    "email": "bignimbus@users.noreply.github.com",
+    "url": "https://github.com/bignimbus"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/bignimbus/pebbql",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bignimbus/pebbql.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bignimbus/pebbql/issues"
+  },
+  "keywords": ["pebble-app", "watchface", "graphql"],
   "private": true,
   "dependencies": {},
   "pebble": {
