@@ -10,6 +10,9 @@
     "uuid": "1cdfdbe0-e490-4e68-ab45-3352c9d2afb5",
     "sdkVersion": "3",
     "enableMultiJS": true,
+    "capabilities": [
+      "configurable"
+    ],
     "targetPlatforms": [
       "aplite",
       "basalt",
